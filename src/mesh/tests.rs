@@ -6,6 +6,9 @@ const AIR: u32 = 0;
 const STONE: u32 = 1;
 const LEAF: u32 = 2;
 const OPAQUE_B: u32 = 5;
+const GLASS: u32 = 3;
+const WATER: u32 = 4;
+const GLASS_B: u32 = 6;
 
 struct TestView {
     height: u16,
@@ -44,6 +47,14 @@ impl TestView {
             self.uv.push((0.0, 0.0));
         }
         self.uv[state as usize] = uv;
+        self
+    }
+
+    fn with_class(mut self, state: u32, class: BlockClass) -> Self {
+        while self.classes.len() <= state as usize {
+            self.classes.push(BlockClass::Air);
+        }
+        self.classes[state as usize] = class;
         self
     }
 }
@@ -95,6 +106,12 @@ fn pair_view() -> TestView {
     let mut states = vec![AIR; 16 * 16 * 16];
     states[idx(8, 8, 8)] = STONE;
     states[idx(9, 8, 8)] = STONE;
+    TestView::new(16, states)
+}
+
+fn cutout_view() -> TestView {
+    let mut states = vec![AIR; 16 * 16 * 16];
+    states[idx(8, 8, 8)] = LEAF;
     TestView::new(16, states)
 }
 
@@ -719,4 +736,165 @@ fn state_boundary_uvs_anchor_own_origins() {
     let other = quad_at(&mesh, Face::PosY, [9.5, 9.0, 8.5]);
     assert_uv_box(&mesh, &stone, 0.0, 0.0);
     assert_uv_box(&mesh, &other, 0.5, 0.25);
+}
+
+#[test]
+fn lone_cutout_emits_twelve_quads() {
+    let mesh = mesh_chunk(&cutout_view()).cutout;
+    assert_eq!(mesh.indices.len() / 6, 12);
+    assert_eq!(mesh.vertices.len(), 48);
+    assert_eq!(mesh.indices.len(), 72);
+    assert_invariants(&mesh);
+}
+
+#[test]
+fn cutout_opaque_neighbor_culls_face() {
+    let mut states = vec![AIR; 16 * 16 * 16];
+    states[idx(8, 8, 8)] = LEAF;
+    states[idx(9, 8, 8)] = STONE;
+    let mesh = mesh_chunk(&TestView::new(16, states)).cutout;
+    assert_eq!(mesh.indices.len() / 6, 10);
+    assert_invariants(&mesh);
+}
+
+#[test]
+fn adjacent_cutout_pair_keeps_shared_face() {
+    let mut states = vec![AIR; 16 * 16 * 16];
+    states[idx(8, 8, 8)] = LEAF;
+    states[idx(9, 8, 8)] = LEAF;
+    let mesh = mesh_chunk(&TestView::new(16, states)).cutout;
+    assert_eq!(mesh.indices.len() / 6, 24);
+    assert_invariants(&mesh);
+}
+
+#[test]
+fn translucent_pair_culls_same_state_only() {
+    let mut states = vec![AIR; 16 * 16 * 16];
+    states[idx(8, 8, 8)] = GLASS;
+    states[idx(9, 8, 8)] = GLASS;
+    let mesh = mesh_chunk(&TestView::new(16, states)).translucent;
+    assert_eq!(mesh.indices.len() / 6, 10);
+
+    let mut states = vec![AIR; 16 * 16 * 16];
+    states[idx(8, 8, 8)] = GLASS;
+    states[idx(9, 8, 8)] = GLASS_B;
+    let mesh = mesh_chunk(
+        &TestView::new(16, states).with_class(GLASS_B, BlockClass::Translucent),
+    )
+    .translucent;
+    assert_eq!(mesh.indices.len() / 6, 12);
+}
+
+#[test]
+fn liquid_faces_cull_by_class_only() {
+    let mut states = vec![AIR; 16 * 16 * 16];
+    states[idx(8, 8, 8)] = WATER;
+    let mesh = mesh_chunk(&TestView::new(16, states)).liquid;
+    assert_eq!(mesh.indices.len() / 6, 6);
+
+    let mut states = vec![AIR; 16 * 16 * 16];
+    states[idx(8, 8, 8)] = WATER;
+    states[idx(8, 9, 8)] = WATER;
+    let mesh = mesh_chunk(&TestView::new(16, states)).liquid;
+    assert_eq!(mesh.indices.len() / 6, 10);
+
+    let mut states = vec![AIR; 16 * 16 * 16];
+    states[idx(8, 8, 8)] = WATER;
+    states[idx(8, 9, 8)] = STONE;
+    let mesh = mesh_chunk(&TestView::new(16, states)).liquid;
+    assert_eq!(mesh.indices.len() / 6, 6);
+}
+
+#[test]
+fn translucent_sorted_farthest_first() {
+    let mut states = vec![AIR; 16 * 16 * 16];
+    states[idx(4, 8, 8)] = GLASS;
+    states[idx(12, 8, 8)] = GLASS;
+    let mesh = mesh_chunk(&TestView::new(16, states)).translucent;
+    assert_eq!(mesh.indices.len() / 6, 12);
+    let expected = [
+        30.0, 30.0, 30.0, 29.0, 29.0, 29.0, 22.0, 22.0, 22.0, 21.0, 21.0, 21.0,
+    ];
+    let centroids: Vec<f32> = mesh
+        .indices
+        .chunks(6)
+        .map(|quad| {
+            let distinct = [quad[0], quad[1], quad[2], quad[5]];
+            let sum: f32 = distinct
+                .iter()
+                .map(|&i| {
+                    let v = &mesh.vertices[i as usize];
+                    v.x + v.y + v.z
+                })
+                .sum();
+            sum / 4.0
+        })
+        .collect();
+    for (got, want) in centroids.iter().zip(expected.iter()) {
+        assert_eq!(*got, *want);
+    }
+}
+
+#[test]
+fn mixed_scene_passes_stay_separate() {
+    let mut states = vec![AIR; 16 * 16 * 16];
+    states[idx(4, 8, 8)] = STONE;
+    states[idx(8, 8, 8)] = LEAF;
+    states[idx(12, 8, 8)] = GLASS;
+    states[idx(8, 8, 12)] = WATER;
+    let chunk = mesh_chunk(&TestView::new(16, states));
+    assert_eq!(chunk.opaque.indices.len() / 6, 6);
+    assert_eq!(chunk.cutout.indices.len() / 6, 12);
+    assert_eq!(chunk.translucent.indices.len() / 6, 6);
+    assert_eq!(chunk.liquid.indices.len() / 6, 6);
+    assert_invariants(&chunk.opaque);
+    assert_invariants(&chunk.cutout);
+    assert_invariants(&chunk.translucent);
+    assert_invariants(&chunk.liquid);
+}
+
+#[test]
+fn cutout_inward_quad_reversed_same_bake() {
+    let mesh = mesh_chunk(&cutout_view()).cutout;
+    let top: Vec<&[u32]> = mesh
+        .indices
+        .chunks(6)
+        .filter(|quad| quad.iter().all(|&i| mesh.vertices[i as usize].y == 9.0))
+        .collect();
+    assert_eq!(top.len(), 2);
+    let has_up = top.iter().any(|quad| normal_of(&mesh, quad) == (0.0, 1.0, 0.0));
+    let has_down = top.iter().any(|quad| normal_of(&mesh, quad) == (0.0, -1.0, 0.0));
+    assert!(has_up);
+    assert!(has_down);
+    let bakes: Vec<Vec<(f32, f32)>> = top
+        .iter()
+        .map(|quad| {
+            let mut distinct: Vec<u32> = Vec::new();
+            for &i in quad.iter() {
+                if !distinct.contains(&i) {
+                    distinct.push(i);
+                }
+            }
+            let mut pairs: Vec<(f32, f32)> = distinct
+                .iter()
+                .map(|&i| {
+                    let v = &mesh.vertices[i as usize];
+                    (v.light, v.ao)
+                })
+                .collect();
+            pairs.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.total_cmp(&y.1)));
+            pairs
+        })
+        .collect();
+    assert_eq!(bakes[0], bakes[1]);
+}
+
+#[test]
+fn cutout_corner_bake_unoccluded() {
+    let mesh = mesh_chunk(&cutout_view().with_light(vec![(10, 5); 4096])).cutout;
+    assert_eq!(mesh.vertices.len(), 48);
+    for v in &mesh.vertices {
+        assert_eq!(v.light, 10.0 / 15.0);
+        assert_eq!(v.ao, 0.0);
+    }
 }

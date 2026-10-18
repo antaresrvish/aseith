@@ -62,11 +62,17 @@ pub fn mesh_chunk(view: &dyn VoxelView) -> ChunkMesh {
     let (w, h, d) = view.dims();
     let mut opaque = Mesh::default();
     emit_opaque(view, w, h, d, &mut opaque);
+    let mut cutout = Mesh::default();
+    emit_pass(view, w, h, d, BlockClass::Cutout, &mut cutout);
+    let mut translucent = Mesh::default();
+    emit_pass(view, w, h, d, BlockClass::Translucent, &mut translucent);
+    let mut liquid = Mesh::default();
+    emit_pass(view, w, h, d, BlockClass::Liquid, &mut liquid);
     ChunkMesh {
         opaque,
-        cutout: Mesh::default(),
-        translucent: Mesh::default(),
-        liquid: Mesh::default(),
+        cutout,
+        translucent,
+        liquid,
     }
 }
 
@@ -137,6 +143,93 @@ fn cell_state(view: &dyn VoxelView, dims: [usize; 3], face: Face, p: usize, i: u
 
 fn state_at(view: &dyn VoxelView, coord: &[usize; 3]) -> u32 {
     view.state_at(coord[0] as u8, coord[1] as u16, coord[2] as u8)
+}
+
+fn emit_pass(view: &dyn VoxelView, w: u8, h: u16, d: u8, class: BlockClass, mesh: &mut Mesh) {
+    let dims = [w as usize, h as usize, d as usize];
+    let dims16 = [dims[0] as i16, dims[1] as i16, dims[2] as i16];
+    let mut quads: Vec<(f32, [Vertex; 4])> = Vec::new();
+    for face in [
+        Face::PosX,
+        Face::NegX,
+        Face::PosY,
+        Face::NegY,
+        Face::PosZ,
+        Face::NegZ,
+    ] {
+        let a = face.axis();
+        let (b, c) = face.cross();
+        for p in 0..dims[a] {
+            for i in 0..dims[b] {
+                for j in 0..dims[c] {
+                    let mut coord = [0usize; 3];
+                    coord[a] = p;
+                    coord[b] = i;
+                    coord[c] = j;
+                    let state = state_at(view, &coord);
+                    if view.class_of(state) != class {
+                        continue;
+                    }
+                    if cell_culled(view, dims, face, &coord, class, state) {
+                        continue;
+                    }
+                    if class == BlockClass::Cutout {
+                        emit_double_quad(view, face, dims16, p, i, j, 1, 1, state, mesh);
+                    } else {
+                        let verts = corner_vertices(view, face, dims16, p, i, j, 1, 1, state);
+                        quads.push((centroid_sum(&verts), verts));
+                    }
+                }
+            }
+        }
+    }
+    quads.sort_by(|x, y| y.0.total_cmp(&x.0));
+    for (_, verts) in quads {
+        let base = mesh.vertices.len() as u32;
+        mesh.vertices.extend_from_slice(&verts);
+        mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+}
+
+fn cell_culled(
+    view: &dyn VoxelView,
+    dims: [usize; 3],
+    face: Face,
+    coord: &[usize; 3],
+    class: BlockClass,
+    state: u32,
+) -> bool {
+    let a = face.axis();
+    let p = coord[a];
+    let s = face.sign();
+    let neighbor = if s > 0 {
+        if p + 1 >= dims[a] {
+            return false;
+        }
+        p + 1
+    } else {
+        if p == 0 {
+            return false;
+        }
+        p - 1
+    };
+    let mut ncoord = *coord;
+    ncoord[a] = neighbor;
+    let nstate = state_at(view, &ncoord);
+    let nclass = view.class_of(nstate);
+    match class {
+        BlockClass::Cutout => nclass == BlockClass::Opaque,
+        BlockClass::Translucent => {
+            nclass == BlockClass::Opaque
+                || (nclass == BlockClass::Translucent && nstate == state)
+        }
+        BlockClass::Liquid => nclass == BlockClass::Liquid,
+        _ => false,
+    }
+}
+
+fn centroid_sum(verts: &[Vertex; 4]) -> f32 {
+    verts.iter().map(|v| v.x + v.y + v.z).sum::<f32>()
 }
 
 fn in_bounds(dims: [i16; 3], cell: [i16; 3]) -> bool {
@@ -234,6 +327,55 @@ fn emit_quad(
     state: u32,
     mesh: &mut Mesh,
 ) {
+    let verts = corner_vertices(view, face, dims, p, i, j, h, w, state);
+    let base = mesh.vertices.len() as u32;
+    mesh.vertices.extend_from_slice(&verts);
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+fn emit_double_quad(
+    view: &dyn VoxelView,
+    face: Face,
+    dims: [i16; 3],
+    p: usize,
+    i: usize,
+    j: usize,
+    h: usize,
+    w: usize,
+    state: u32,
+    mesh: &mut Mesh,
+) {
+    let verts = corner_vertices(view, face, dims, p, i, j, h, w, state);
+    let base = mesh.vertices.len() as u32;
+    mesh.vertices.extend_from_slice(&verts);
+    mesh.vertices.extend_from_slice(&verts);
+    mesh.indices.extend_from_slice(&[
+        base,
+        base + 1,
+        base + 2,
+        base,
+        base + 2,
+        base + 3,
+        base + 7,
+        base + 6,
+        base + 5,
+        base + 7,
+        base + 4,
+        base + 5,
+    ]);
+}
+
+fn corner_vertices(
+    view: &dyn VoxelView,
+    face: Face,
+    dims: [i16; 3],
+    p: usize,
+    i: usize,
+    j: usize,
+    h: usize,
+    w: usize,
+    state: u32,
+) -> [Vertex; 4] {
     let a = face.axis();
     let s = face.sign();
     let (b, c) = face.cross();
@@ -242,7 +384,7 @@ fn emit_quad(
     let span_u = h as f32 * BLOCK_TEXEL;
     let span_v = w as f32 * BLOCK_TEXEL;
     let corners = face.corners();
-    let base = mesh.vertices.len() as u32;
+    let mut verts = [Vertex::default(); 4];
     for k in 0..4 {
         let off = corners[k];
         let (coord_b, voxel_b) = if off[b] > 0 {
@@ -266,7 +408,7 @@ fn emit_quad(
         pos[c] = coord_c as f32;
         let u = u0 + if off[b] > 0 { span_u } else { 0.0 };
         let v = v0 + if off[c] > 0 { span_v } else { 0.0 };
-        mesh.vertices.push(Vertex {
+        verts[k] = Vertex {
             x: pos[0],
             y: pos[1],
             z: pos[2],
@@ -274,9 +416,9 @@ fn emit_quad(
             v,
             light,
             ao,
-        });
+        };
     }
-    mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    verts
 }
 
 impl Face {
