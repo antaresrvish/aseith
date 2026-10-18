@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use super::{mesh_chunk, BlockClass, Face, Mesh, VoxelView};
+use super::{mesh_chunk, BlockClass, Face, Mesh, Vertex, VoxelView};
 
 const AIR: u32 = 0;
 const STONE: u32 = 1;
@@ -11,6 +11,7 @@ struct TestView {
     height: u16,
     states: Vec<u32>,
     classes: Vec<BlockClass>,
+    light: Option<Vec<(u8, u8)>>,
 }
 
 impl TestView {
@@ -26,7 +27,13 @@ impl TestView {
                 BlockClass::Liquid,
                 BlockClass::Opaque,
             ],
+            light: None,
         }
+    }
+
+    fn with_light(mut self, light: Vec<(u8, u8)>) -> Self {
+        self.light = Some(light);
+        self
     }
 }
 
@@ -45,6 +52,9 @@ impl VoxelView for TestView {
     }
 
     fn light_at(&self, x: u8, y: u16, z: u8) -> (u8, u8) {
+        if let Some(light) = &self.light {
+            return light.get(idx(x, y, z)).copied().unwrap_or((0, 0));
+        }
         (
             ((x as usize + y as usize * 3) % 16) as u8,
             ((z as usize + y as usize * 7) % 16) as u8,
@@ -178,6 +188,50 @@ fn assert_invariants(mesh: &Mesh) {
     for &index in &mesh.indices {
         assert!((index as usize) < mesh.vertex_count());
     }
+}
+
+fn corner_vertex(mesh: &Mesh, face: Face, ref_point: [f32; 3], point: [f32; 3]) -> Vertex {
+    for quad in mesh.indices.chunks(6) {
+        let (quad_face, _min, _max) = quad_geom(mesh, quad);
+        if quad_face != face {
+            continue;
+        }
+        let has_ref = quad.iter().any(|&i| {
+            let v = &mesh.vertices[i as usize];
+            let p = [v.x, v.y, v.z];
+            p.iter().zip(&ref_point).all(|(a, b)| (a - b).abs() < 1e-6)
+        });
+        if !has_ref {
+            continue;
+        }
+        for &i in quad {
+            let v = &mesh.vertices[i as usize];
+            let p = [v.x, v.y, v.z];
+            if p.iter().zip(&point).all(|(a, b)| (a - b).abs() < 1e-6) {
+                return *v;
+            }
+        }
+    }
+    panic!("vertex not found");
+}
+
+fn ao_fixture(occl: [bool; 3]) -> TestView {
+    let mut states = vec![AIR; 16 * 16 * 16];
+    states[idx(8, 8, 8)] = STONE;
+    if occl[0] {
+        states[idx(9, 8, 8)] = OPAQUE_B;
+    }
+    if occl[1] {
+        states[idx(8, 8, 9)] = OPAQUE_B;
+    }
+    if occl[2] {
+        states[idx(9, 8, 9)] = OPAQUE_B;
+    }
+    TestView::new(16, states)
+}
+
+fn probe_ao(mesh: &Mesh) -> f32 {
+    corner_vertex(mesh, Face::PosY, [8.0, 9.0, 8.0], [9.0, 9.0, 9.0]).ao
 }
 
 #[test]
@@ -391,18 +445,111 @@ fn quads_occupy_span_corners() {
 }
 
 #[test]
+fn uniform_light_bakes_full_bright() {
+    let view = single_voxel_view().with_light(vec![(15u8, 15u8); 4096]);
+    let mesh = mesh_chunk(&view).opaque;
+    for v in &mesh.vertices {
+        assert!((v.light - 1.0).abs() < 1e-6);
+        assert!((v.ao - 0.0).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn corner_light_reads_own_diagonal() {
+    let mut light = vec![(0u8, 0u8); 4096];
+    light[idx(9, 8, 9)] = (0, 15);
+    let view = single_voxel_view().with_light(light);
+    let mesh = mesh_chunk(&view).opaque;
+    let v = corner_vertex(&mesh, Face::PosY, [8.0, 9.0, 8.0], [9.0, 9.0, 9.0]);
+    assert!((v.light - 1.0).abs() < 1e-6);
+    let v = corner_vertex(&mesh, Face::PosY, [8.0, 9.0, 8.0], [8.0, 9.0, 8.0]);
+    assert!((v.light - 0.0).abs() < 1e-6);
+    let v = corner_vertex(&mesh, Face::PosY, [8.0, 9.0, 8.0], [9.0, 9.0, 8.0]);
+    assert!((v.light - 0.0).abs() < 1e-6);
+    let v = corner_vertex(&mesh, Face::PosY, [8.0, 9.0, 8.0], [8.0, 9.0, 9.0]);
+    assert!((v.light - 0.0).abs() < 1e-6);
+}
+
+#[test]
+fn ao_matches_occlusion_matrix() {
+    let cases: [([bool; 3], f32); 6] = [
+        ([false, false, false], 0.0),
+        ([false, false, true], 2.0 / 3.0),
+        ([true, false, false], 2.0 / 3.0),
+        ([true, false, true], 1.0 / 3.0),
+        ([true, true, false], 1.0),
+        ([true, true, true], 1.0),
+    ];
+    for (occl, want) in cases {
+        let view = ao_fixture(occl);
+        let mesh = mesh_chunk(&view).opaque;
+        assert!((probe_ao(&mesh) - want).abs() < 1e-6, "occl {:?}", occl);
+    }
+}
+
+#[test]
+fn ao_both_sides_rule() {
+    let view = ao_fixture([true, true, false]);
+    let mesh = mesh_chunk(&view).opaque;
+    assert!((probe_ao(&mesh) - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn merged_top_face_out_of_bounds_light() {
+    let view = solid_view()
+        .with_light((0..4096u32).map(|i| (((i >> 4) & 15) as u8, 0u8)).collect());
+    let mesh = mesh_chunk(&view).opaque;
+    let quad = mesh
+        .indices
+        .chunks(6)
+        .find(|quad| {
+            let (face, _min, _max) = quad_geom(&mesh, quad);
+            face == Face::PosY && quad.iter().all(|&i| mesh.vertices[i as usize].y == 16.0)
+        })
+        .expect("merged top face");
+    for &i in quad {
+        let v = &mesh.vertices[i as usize];
+        assert!((v.light - 1.0).abs() < 1e-6);
+        assert!((v.ao - 0.0).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn out_of_bounds_corner_light() {
+    let mut states = vec![AIR; 16 * 16 * 16];
+    states[idx(15, 15, 15)] = STONE;
+    let view = TestView::new(16, states).with_light(vec![(0u8, 0u8); 4096]);
+    let mesh = mesh_chunk(&view).opaque;
+    let v = corner_vertex(&mesh, Face::PosX, [16.0, 15.0, 15.0], [16.0, 16.0, 16.0]);
+    assert!((v.light - 1.0).abs() < 1e-6);
+    assert!((v.ao - 0.0).abs() < 1e-6);
+    let v = corner_vertex(&mesh, Face::PosX, [16.0, 15.0, 15.0], [16.0, 15.0, 15.0]);
+    assert!((v.light - 0.0).abs() < 1e-6);
+    assert!((v.ao - 0.0).abs() < 1e-6);
+    let v = corner_vertex(&mesh, Face::PosY, [15.0, 16.0, 15.0], [16.0, 16.0, 16.0]);
+    assert!((v.light - 1.0).abs() < 1e-6);
+    assert!((v.ao - 0.0).abs() < 1e-6);
+    let v = corner_vertex(&mesh, Face::PosZ, [15.0, 15.0, 16.0], [16.0, 16.0, 16.0]);
+    assert!((v.light - 1.0).abs() < 1e-6);
+    assert!((v.ao - 0.0).abs() < 1e-6);
+}
+
+#[test]
 fn corner_light_matches_span_corner_voxel() {
     let view = carved_view();
     let mesh = mesh_chunk(&view).opaque;
+    let (w, h, d) = view.dims();
+    let dims = [w as i32, h as i32, d as i32];
     for quad in mesh.indices.chunks(6) {
         let (face, _min, max) = quad_geom(&mesh, quad);
         let axis = face.axis();
+        let (b, c) = face.cross();
         for &i in quad {
             let v = &mesh.vertices[i as usize];
             let p = [v.x, v.y, v.z];
-            let mut voxel = [0i32; 3];
+            let mut solid = [0i32; 3];
             for k in 0..3 {
-                voxel[k] = if k == axis {
+                solid[k] = if k == axis {
                     if face.sign() > 0 {
                         p[k] as i32 - 1
                     } else {
@@ -414,14 +561,45 @@ fn corner_light_matches_span_corner_voxel() {
                     p[k] as i32
                 };
             }
-            let (sky, block) = view.light_at(
-                voxel[0] as u8,
-                voxel[1] as u16,
-                voxel[2] as u8,
-            );
-            let want = sky.max(block) as f32 / 15.0;
-            assert!((v.light - want).abs() < 1e-6);
-            assert_eq!(v.ao, 0.0);
+            let db = if (p[b] - max[b]).abs() < 1e-4 { 1 } else { -1 };
+            let dc = if (p[c] - max[c]).abs() < 1e-4 { 1 } else { -1 };
+            let mut s1 = solid;
+            s1[b] += db;
+            let mut s2 = solid;
+            s2[c] += dc;
+            let mut sc = solid;
+            sc[b] += db;
+            sc[c] += dc;
+            let cells = [s1, s2, sc];
+            let mut sky = 0i32;
+            let mut block = 0i32;
+            let mut occl = [false; 3];
+            for k in 0..3 {
+                let cell = cells[k];
+                let oob = (0..3).any(|k| cell[k] < 0 || cell[k] >= dims[k]);
+                if oob {
+                    sky = 15;
+                    block = 15;
+                } else {
+                    let l = view.light_at(cell[0] as u8, cell[1] as u16, cell[2] as u8);
+                    sky = sky.max(l.0 as i32);
+                    block = block.max(l.1 as i32);
+                    occl[k] =
+                        view.class_of(view.state_at(cell[0] as u8, cell[1] as u16, cell[2] as u8))
+                            == BlockClass::Opaque;
+                }
+            }
+            let want_light = sky.max(block) as f32 / 15.0;
+            assert!((v.light - want_light).abs() < 1e-6);
+            let n = occl.iter().filter(|x| **x).count() as i32;
+            let mc_ao = if n == 0 {
+                0
+            } else if occl[0] && occl[1] {
+                3
+            } else {
+                3 - n
+            };
+            assert!((v.ao - mc_ao as f32 / 3.0).abs() < 1e-6);
         }
     }
 }

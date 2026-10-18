@@ -88,6 +88,7 @@ fn emit_face(view: &dyn VoxelView, dims: [usize; 3], face: Face, mesh: &mut Mesh
     let dim_a = dims[a];
     let dim_b = dims[b];
     let dim_c = dims[c];
+    let dims16 = [dims[0] as i16, dims[1] as i16, dims[2] as i16];
     let mut grid = vec![None; dim_b * dim_c];
     for p in 0..dim_a {
         for i in 0..dim_b {
@@ -96,7 +97,7 @@ fn emit_face(view: &dyn VoxelView, dims: [usize; 3], face: Face, mesh: &mut Mesh
             }
         }
         for (i, j, h, w, state) in greedy(&mut grid, dim_b, dim_c) {
-            emit_quad(view, face, p, i, j, h, w, state, mesh);
+            emit_quad(view, face, dims16, p, i, j, h, w, state, mesh);
         }
     }
 }
@@ -136,8 +137,55 @@ fn state_at(view: &dyn VoxelView, coord: &[usize; 3]) -> u32 {
     view.state_at(coord[0] as u8, coord[1] as u16, coord[2] as u8)
 }
 
-fn light_at(view: &dyn VoxelView, coord: &[usize; 3]) -> (u8, u8) {
-    view.light_at(coord[0] as u8, coord[1] as u16, coord[2] as u8)
+fn in_bounds(dims: [i16; 3], cell: [i16; 3]) -> bool {
+    (0..dims[0]).contains(&cell[0]) && (0..dims[1]).contains(&cell[1]) && (0..dims[2]).contains(&cell[2])
+}
+
+fn is_solid(view: &dyn VoxelView, dims: [i16; 3], cell: [i16; 3]) -> bool {
+    in_bounds(dims, cell) && view.class_of(view.state_at(cell[0] as u8, cell[1] as u16, cell[2] as u8)) == BlockClass::Opaque
+}
+
+fn sample_cells(face: Face, solid: [i16; 3], corner: [i16; 3]) -> [[i16; 3]; 3] {
+    let (b, c) = face.cross();
+    let db: i16 = if corner[b] > 0 { 1 } else { -1 };
+    let dc: i16 = if corner[c] > 0 { 1 } else { -1 };
+    let mut s1 = solid;
+    s1[b] += db;
+    let mut s2 = solid;
+    s2[c] += dc;
+    let mut sc = solid;
+    sc[b] += db;
+    sc[c] += dc;
+    [s1, s2, sc]
+}
+
+fn corner_light_ao(view: &dyn VoxelView, dims: [i16; 3], face: Face, solid: [i16; 3], corner: [i16; 3]) -> (f32, f32) {
+    let cells = sample_cells(face, solid, corner);
+    let mut sky = 0u8;
+    let mut block = 0u8;
+    let mut occl = [false; 3];
+    for k in 0..3 {
+        let cell = cells[k];
+        if in_bounds(dims, cell) {
+            let l = view.light_at(cell[0] as u8, cell[1] as u16, cell[2] as u8);
+            sky = sky.max(l.0);
+            block = block.max(l.1);
+            occl[k] = is_solid(view, dims, cell);
+        } else {
+            sky = 15;
+            block = 15;
+        }
+    }
+    let light = sky.max(block) as f32 / 15.0;
+    let n = occl.iter().filter(|x| **x).count();
+    let mc_ao = if n == 0 {
+        0
+    } else if occl[0] && occl[1] {
+        3
+    } else {
+        3 - (occl[0] as i16 + occl[1] as i16 + occl[2] as i16)
+    };
+    (light, mc_ao as f32 / 3.0)
 }
 
 fn greedy(grid: &mut [Option<u32>], rows: usize, cols: usize) -> Vec<(usize, usize, usize, usize, u32)> {
@@ -175,6 +223,7 @@ fn greedy(grid: &mut [Option<u32>], rows: usize, cols: usize) -> Vec<(usize, usi
 fn emit_quad(
     view: &dyn VoxelView,
     face: Face,
+    dims: [i16; 3],
     p: usize,
     i: usize,
     j: usize,
@@ -202,12 +251,11 @@ fn emit_quad(
         } else {
             (j, j)
         };
-        let mut lcoord = [0usize; 3];
-        lcoord[a] = p;
-        lcoord[b] = voxel_b;
-        lcoord[c] = voxel_c;
-        let (sky, block) = light_at(view, &lcoord);
-        let light = sky.max(block) as f32 / 15.0;
+        let mut solid = [0i16; 3];
+        solid[a] = p as i16;
+        solid[b] = voxel_b as i16;
+        solid[c] = voxel_c as i16;
+        let (light, ao) = corner_light_ao(view, dims, face, solid, off);
         let mut pos = [0.0f32; 3];
         pos[a] = plane as f32;
         pos[b] = coord_b as f32;
@@ -219,7 +267,7 @@ fn emit_quad(
             u,
             v,
             light,
-            ao: 0.0,
+            ao,
         });
     }
     mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
