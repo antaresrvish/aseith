@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use super::{mesh_chunk, BlockClass, Face, Mesh, Vertex, VoxelView};
+use super::{mesh_chunk, BlockClass, Face, Mesh, Vertex, VoxelView, BLOCK_TEXEL};
 
 const AIR: u32 = 0;
 const STONE: u32 = 1;
@@ -12,27 +12,38 @@ struct TestView {
     states: Vec<u32>,
     classes: Vec<BlockClass>,
     light: Option<Vec<(u8, u8)>>,
+    uv: Vec<(f32, f32)>,
 }
 
 impl TestView {
     fn new(height: u16, states: Vec<u32>) -> Self {
+        let classes = vec![
+            BlockClass::Air,
+            BlockClass::Opaque,
+            BlockClass::Cutout,
+            BlockClass::Translucent,
+            BlockClass::Liquid,
+            BlockClass::Opaque,
+        ];
         Self {
             height,
             states,
-            classes: vec![
-                BlockClass::Air,
-                BlockClass::Opaque,
-                BlockClass::Cutout,
-                BlockClass::Translucent,
-                BlockClass::Liquid,
-                BlockClass::Opaque,
-            ],
+            uv: vec![(0.0, 0.0); classes.len()],
+            classes,
             light: None,
         }
     }
 
     fn with_light(mut self, light: Vec<(u8, u8)>) -> Self {
         self.light = Some(light);
+        self
+    }
+
+    fn with_uv(mut self, state: u32, uv: (f32, f32)) -> Self {
+        while self.uv.len() <= state as usize {
+            self.uv.push((0.0, 0.0));
+        }
+        self.uv[state as usize] = uv;
         self
     }
 }
@@ -61,8 +72,8 @@ impl VoxelView for TestView {
         )
     }
 
-    fn uv_of(&self, _state: u32, _face: Face) -> (f32, f32) {
-        (0.0, 0.0)
+    fn uv_of(&self, state: u32, _face: Face) -> (f32, f32) {
+        self.uv.get(state as usize).copied().unwrap_or((0.0, 0.0))
     }
 }
 
@@ -126,6 +137,15 @@ fn split_plane_view() -> TestView {
         }
     }
     TestView::new(16, states)
+}
+
+fn boundary_view() -> TestView {
+    let mut states = vec![AIR; 16 * 16 * 16];
+    states[idx(8, 8, 8)] = STONE;
+    states[idx(9, 8, 8)] = OPAQUE_B;
+    TestView::new(16, states)
+        .with_uv(STONE, (0.0, 0.0))
+        .with_uv(OPAQUE_B, (0.5, 0.25))
 }
 
 fn normal_of(mesh: &Mesh, quad: &[u32]) -> (f32, f32, f32) {
@@ -602,4 +622,101 @@ fn corner_light_matches_span_corner_voxel() {
             assert!((v.ao - mc_ao as f32 / 3.0).abs() < 1e-6);
         }
     }
+}
+
+fn uv_span(mesh: &Mesh, quad: &[u32]) -> (f32, f32) {
+    let mut min_u = f32::INFINITY;
+    let mut max_u = f32::NEG_INFINITY;
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    for &i in quad {
+        let v = &mesh.vertices[i as usize];
+        min_u = min_u.min(v.u);
+        max_u = max_u.max(v.u);
+        min_v = min_v.min(v.v);
+        max_v = max_v.max(v.v);
+    }
+    (max_u - min_u, max_v - min_v)
+}
+
+fn quad_at(mesh: &Mesh, face: Face, point: [f32; 3]) -> [u32; 6] {
+    for quad in mesh.indices.chunks(6) {
+        let (quad_face, min, max) = quad_geom(mesh, quad);
+        let inside = (0..3).all(|k| point[k] >= min[k] - 1e-6 && point[k] <= max[k] + 1e-6);
+        if quad_face == face && inside {
+            return quad.try_into().unwrap();
+        }
+    }
+    panic!("quad not found");
+}
+
+fn assert_uv_box(mesh: &Mesh, quad: &[u32], u0: f32, v0: f32) {
+    for &i in quad {
+        let v = &mesh.vertices[i as usize];
+        let at_u = (v.u - u0).abs() < 1e-6 || (v.u - (u0 + BLOCK_TEXEL)).abs() < 1e-6;
+        let at_v = (v.v - v0).abs() < 1e-6 || (v.v - (v0 + BLOCK_TEXEL)).abs() < 1e-6;
+        assert!(at_u && at_v);
+    }
+}
+
+#[test]
+fn single_face_quad_uv_square() {
+    let mesh = mesh_chunk(&single_voxel_view()).opaque;
+    for quad in mesh.indices.chunks(6) {
+        let (du, dv) = uv_span(&mesh, quad);
+        assert_eq!(du, BLOCK_TEXEL);
+        assert_eq!(dv, BLOCK_TEXEL);
+        let mut corners: Vec<(f32, f32)> = Vec::new();
+        for &i in quad {
+            let v = &mesh.vertices[i as usize];
+            let c = (v.u, v.v);
+            if !corners.contains(&c) {
+                corners.push(c);
+            }
+        }
+        assert_eq!(corners.len(), 4);
+        for u in [0.0f32, BLOCK_TEXEL] {
+            for v in [0.0f32, BLOCK_TEXEL] {
+                assert!(corners.contains(&(u, v)));
+            }
+        }
+    }
+}
+
+#[test]
+fn merged_quad_uv_scales_with_span() {
+    let mesh = mesh_chunk(&pair_view()).opaque;
+    let quad = quad_at(&mesh, Face::PosY, [8.5, 9.0, 8.5]);
+    let (du, dv) = uv_span(&mesh, &quad);
+    assert_eq!(du, 2.0 * BLOCK_TEXEL);
+    assert_eq!(dv, BLOCK_TEXEL);
+}
+
+#[test]
+fn full_cube_top_quad_uv_full_block() {
+    let mesh = mesh_chunk(&solid_view()).opaque;
+    let quad = quad_at(&mesh, Face::PosY, [8.0, 16.0, 8.0]);
+    let (du, dv) = uv_span(&mesh, &quad);
+    assert_eq!(du, 16.0 * BLOCK_TEXEL);
+    assert_eq!(dv, 16.0 * BLOCK_TEXEL);
+    assert_eq!(du, 1.0);
+    assert_eq!(dv, 1.0);
+}
+
+#[test]
+fn full_cube_uvs_within_atlas() {
+    let mesh = mesh_chunk(&solid_view()).opaque;
+    for v in &mesh.vertices {
+        assert!((0.0..=1.0).contains(&v.u));
+        assert!((0.0..=1.0).contains(&v.v));
+    }
+}
+
+#[test]
+fn state_boundary_uvs_anchor_own_origins() {
+    let mesh = mesh_chunk(&boundary_view()).opaque;
+    let stone = quad_at(&mesh, Face::PosY, [8.5, 9.0, 8.5]);
+    let other = quad_at(&mesh, Face::PosY, [9.5, 9.0, 8.5]);
+    assert_uv_box(&mesh, &stone, 0.0, 0.0);
+    assert_uv_box(&mesh, &other, 0.5, 0.25);
 }

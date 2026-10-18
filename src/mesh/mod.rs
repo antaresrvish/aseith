@@ -56,6 +56,8 @@ pub trait VoxelView {
     fn uv_of(&self, state: u32, face: Face) -> (f32, f32);
 }
 
+const BLOCK_TEXEL: f32 = 16.0 / 256.0;
+
 pub fn mesh_chunk(view: &dyn VoxelView) -> ChunkMesh {
     let (w, h, d) = view.dims();
     let mut opaque = Mesh::default();
@@ -236,7 +238,9 @@ fn emit_quad(
     let s = face.sign();
     let (b, c) = face.cross();
     let plane = p + if s > 0 { 1 } else { 0 };
-    let (u, v) = view.uv_of(state, face);
+    let (u0, v0) = view.uv_of(state, face);
+    let span_u = h as f32 * BLOCK_TEXEL;
+    let span_v = w as f32 * BLOCK_TEXEL;
     let corners = face.corners();
     let base = mesh.vertices.len() as u32;
     for k in 0..4 {
@@ -260,6 +264,8 @@ fn emit_quad(
         pos[a] = plane as f32;
         pos[b] = coord_b as f32;
         pos[c] = coord_c as f32;
+        let u = u0 + if off[b] > 0 { span_u } else { 0.0 };
+        let v = v0 + if off[c] > 0 { span_v } else { 0.0 };
         mesh.vertices.push(Vertex {
             x: pos[0],
             y: pos[1],
