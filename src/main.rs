@@ -1,3 +1,4 @@
+mod gpu;
 mod mesh;
 mod nbt;
 mod renderer;
