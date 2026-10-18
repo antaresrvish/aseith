@@ -1,3 +1,4 @@
+mod nbt;
 mod renderer;
 
 use std::sync::Arc;
