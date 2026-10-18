@@ -58,51 +58,8 @@ pub trait VoxelView {
 
 pub fn mesh_chunk(view: &dyn VoxelView) -> ChunkMesh {
     let (w, h, d) = view.dims();
-    let voxels = w as usize * h as usize * d as usize;
-    let mut opaque = Mesh {
-        vertices: Vec::with_capacity(voxels * 4),
-        indices: Vec::with_capacity(voxels * 6),
-    };
-
-    for y in 0..h {
-        for z in 0..d {
-            for x in 0..w {
-                let state = view.state_at(x, y, z);
-                if view.class_of(state) != BlockClass::Opaque {
-                    continue;
-                }
-                for face in [
-                    Face::PosX,
-                    Face::NegX,
-                    Face::PosY,
-                    Face::NegY,
-                    Face::PosZ,
-                    Face::NegZ,
-                ] {
-                    if neighbor_is_opaque(view, w, h, d, x, y, z, face) {
-                        continue;
-                    }
-                    let (u, v) = view.uv_of(state, face);
-                    let (sky, block) = view.light_at(x, y, z);
-                    let light = sky.max(block) as f32 / 15.0;
-                    let base = opaque.vertices.len() as u32;
-                    for corner in face.corners() {
-                        opaque.vertices.push(Vertex {
-                            x: x as f32 + corner[0] as f32,
-                            y: y as f32 + corner[1] as f32,
-                            z: z as f32 + corner[2] as f32,
-                            u,
-                            v,
-                            light,
-                            ao: 0.0,
-                        });
-                    }
-                    opaque.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-                }
-            }
-        }
-    }
-
+    let mut opaque = Mesh::default();
+    emit_opaque(view, w, h, d, &mut opaque);
     ChunkMesh {
         opaque,
         cutout: Mesh::default(),
@@ -111,16 +68,161 @@ pub fn mesh_chunk(view: &dyn VoxelView) -> ChunkMesh {
     }
 }
 
-fn neighbor_is_opaque(view: &dyn VoxelView, w: u8, h: u16, d: u8, x: u8, y: u16, z: u8, face: Face) -> bool {
-    let (ox, oy, oz) = face.offset();
-    let nx = x as i16 + ox;
-    let ny = y as i16 + oy;
-    let nz = z as i16 + oz;
-    if nx < 0 || nx >= w as i16 || ny < 0 || ny >= h as i16 || nz < 0 || nz >= d as i16 {
-        return false;
+fn emit_opaque(view: &dyn VoxelView, w: u8, h: u16, d: u8, mesh: &mut Mesh) {
+    let dims = [w as usize, h as usize, d as usize];
+    for face in [
+        Face::PosX,
+        Face::NegX,
+        Face::PosY,
+        Face::NegY,
+        Face::PosZ,
+        Face::NegZ,
+    ] {
+        emit_face(view, dims, face, mesh);
     }
-    let neighbor = view.state_at(nx as u8, ny as u16, nz as u8);
-    view.class_of(neighbor) == BlockClass::Opaque
+}
+
+fn emit_face(view: &dyn VoxelView, dims: [usize; 3], face: Face, mesh: &mut Mesh) {
+    let a = face.axis();
+    let (b, c) = face.cross();
+    let dim_a = dims[a];
+    let dim_b = dims[b];
+    let dim_c = dims[c];
+    let mut grid = vec![None; dim_b * dim_c];
+    for p in 0..dim_a {
+        for i in 0..dim_b {
+            for j in 0..dim_c {
+                grid[i * dim_c + j] = cell_state(view, dims, face, p, i, j);
+            }
+        }
+        for (i, j, h, w, state) in greedy(&mut grid, dim_b, dim_c) {
+            emit_quad(view, face, p, i, j, h, w, state, mesh);
+        }
+    }
+}
+
+fn cell_state(view: &dyn VoxelView, dims: [usize; 3], face: Face, p: usize, i: usize, j: usize) -> Option<u32> {
+    let a = face.axis();
+    let s = face.sign();
+    let (b, c) = face.cross();
+    let mut coord = [0usize; 3];
+    coord[a] = p;
+    coord[b] = i;
+    coord[c] = j;
+    let state = state_at(view, &coord);
+    if view.class_of(state) != BlockClass::Opaque {
+        return None;
+    }
+    let neighbor = if s > 0 {
+        if p + 1 >= dims[a] {
+            return Some(state);
+        }
+        p + 1
+    } else {
+        if p == 0 {
+            return Some(state);
+        }
+        p - 1
+    };
+    let mut ncoord = coord;
+    ncoord[a] = neighbor;
+    if view.class_of(state_at(view, &ncoord)) == BlockClass::Opaque {
+        return None;
+    }
+    Some(state)
+}
+
+fn state_at(view: &dyn VoxelView, coord: &[usize; 3]) -> u32 {
+    view.state_at(coord[0] as u8, coord[1] as u16, coord[2] as u8)
+}
+
+fn light_at(view: &dyn VoxelView, coord: &[usize; 3]) -> (u8, u8) {
+    view.light_at(coord[0] as u8, coord[1] as u16, coord[2] as u8)
+}
+
+fn greedy(grid: &mut [Option<u32>], rows: usize, cols: usize) -> Vec<(usize, usize, usize, usize, u32)> {
+    let mut quads = Vec::new();
+    for i in 0..rows {
+        for j in 0..cols {
+            let state = match grid[i * cols + j] {
+                Some(state) => state,
+                None => continue,
+            };
+            let mut w = 0;
+            while j + w < cols && grid[i * cols + j + w] == Some(state) {
+                w += 1;
+            }
+            let mut h = 0;
+            'height: while i + h < rows {
+                for k in 0..w {
+                    if grid[(i + h) * cols + j + k] != Some(state) {
+                        break 'height;
+                    }
+                }
+                h += 1;
+            }
+            quads.push((i, j, h, w, state));
+            for di in 0..h {
+                for dk in 0..w {
+                    grid[(i + di) * cols + j + dk] = None;
+                }
+            }
+        }
+    }
+    quads
+}
+
+fn emit_quad(
+    view: &dyn VoxelView,
+    face: Face,
+    p: usize,
+    i: usize,
+    j: usize,
+    h: usize,
+    w: usize,
+    state: u32,
+    mesh: &mut Mesh,
+) {
+    let a = face.axis();
+    let s = face.sign();
+    let (b, c) = face.cross();
+    let plane = p + if s > 0 { 1 } else { 0 };
+    let (u, v) = view.uv_of(state, face);
+    let corners = face.corners();
+    let base = mesh.vertices.len() as u32;
+    for k in 0..4 {
+        let off = corners[k];
+        let (coord_b, voxel_b) = if off[b] > 0 {
+            (i + h, i + h - 1)
+        } else {
+            (i, i)
+        };
+        let (coord_c, voxel_c) = if off[c] > 0 {
+            (j + w, j + w - 1)
+        } else {
+            (j, j)
+        };
+        let mut lcoord = [0usize; 3];
+        lcoord[a] = p;
+        lcoord[b] = voxel_b;
+        lcoord[c] = voxel_c;
+        let (sky, block) = light_at(view, &lcoord);
+        let light = sky.max(block) as f32 / 15.0;
+        let mut pos = [0.0f32; 3];
+        pos[a] = plane as f32;
+        pos[b] = coord_b as f32;
+        pos[c] = coord_c as f32;
+        mesh.vertices.push(Vertex {
+            x: pos[0],
+            y: pos[1],
+            z: pos[2],
+            u,
+            v,
+            light,
+            ao: 0.0,
+        });
+    }
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
 impl Face {
@@ -132,6 +234,41 @@ impl Face {
             Face::NegY => (0, -1, 0),
             Face::PosZ => (0, 0, 1),
             Face::NegZ => (0, 0, -1),
+        }
+    }
+
+    fn axis(&self) -> usize {
+        let (ox, oy, _) = self.offset();
+        if ox != 0 {
+            0
+        } else if oy != 0 {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn sign(&self) -> i8 {
+        let (ox, oy, oz) = self.offset();
+        let v = if ox != 0 {
+            ox
+        } else if oy != 0 {
+            oy
+        } else {
+            oz
+        };
+        if v > 0 {
+            1
+        } else {
+            -1
+        }
+    }
+
+    fn cross(&self) -> (usize, usize) {
+        match self {
+            Face::PosX | Face::NegX => (1, 2),
+            Face::PosY | Face::NegY => (0, 2),
+            Face::PosZ | Face::NegZ => (0, 1),
         }
     }
 
