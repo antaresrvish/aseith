@@ -1,0 +1,6 @@
+target/
+shaders/spirv/
+.idea/
+.vscode/
+*.rs.bk
+.env
