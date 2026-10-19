@@ -28,9 +28,9 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn byte(&mut self) -> Result<u8, Error> {
-        let b = self.data.get(self.pos).ok_or(Error::Truncated)?;
+        let b = *self.data.get(self.pos).ok_or(Error::Truncated)?;
         self.pos += 1;
-        Ok(*b)
+        Ok(b)
     }
 
     fn bytes(&mut self, len: usize) -> Result<&'a [u8], Error> {

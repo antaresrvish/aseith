@@ -3,6 +3,7 @@ mod level;
 mod mesh;
 mod nbt;
 mod region;
+mod section;
 mod renderer;
 
 use std::sync::Arc;

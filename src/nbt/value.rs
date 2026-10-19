@@ -76,4 +76,11 @@ impl Value {
             _ => None,
         }
     }
+
+    pub fn as_long_array(&self) -> Option<&[i64]> {
+        match self {
+            Value::LongArray(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
 }
