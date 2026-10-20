@@ -26,8 +26,10 @@ pub fn decode(data: &[u8]) -> Result<Image, Error> {
         return Err(Error::NotAPng);
     }
     let mut pos = 8;
-    let mut size: Option<(u32, u32)> = None;
+    let mut size: Option<(u32, u32, u8)> = None;
     let mut idat: Vec<u8> = Vec::new();
+    let mut plte: Option<Vec<u8>> = None;
+    let mut trns: Option<Vec<u8>> = None;
     while pos + 8 <= data.len() {
         let len = u32::from_be_bytes([
             data[pos],
@@ -44,35 +46,54 @@ pub fn decode(data: &[u8]) -> Result<Image, Error> {
             size = Some(read_ihdr(body)?);
         } else if name == b"IDAT" {
             idat.extend_from_slice(body);
+        } else if name == b"PLTE" {
+            plte = Some(body.to_vec());
+        } else if name == b"tRNS" {
+            trns = Some(body.to_vec());
         } else if name == b"IEND" {
             break;
         }
         pos += 12 + len;
     }
-    let (w, h) = size.ok_or(Error::Truncated)?;
-    inflate(w, h, &idat)
+    let (w, h, color) = size.ok_or(Error::Truncated)?;
+    inflate(w, h, color, plte.as_deref(), trns.as_deref(), &idat)
 }
 
-fn read_ihdr(body: &[u8]) -> Result<(u32, u32), Error> {
+fn read_ihdr(body: &[u8]) -> Result<(u32, u32, u8), Error> {
     if body.len() < 13 {
         return Err(Error::BadIhdr);
     }
     let w = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
     let h = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    let color = body[9];
     if body[8] != 8 {
         return Err(Error::BitDepth(body[8]));
     }
-    if body[9] != 6 {
-        return Err(Error::ColorType(body[9]));
+    if !matches!(color, 0 | 2 | 3 | 4 | 6) {
+        return Err(Error::ColorType(color));
     }
     if body[12] != 0 {
         return Err(Error::Interlaced);
     }
-    Ok((w, h))
+    Ok((w, h, color))
 }
 
-fn inflate(w: u32, h: u32, idat: &[u8]) -> Result<Image, Error> {
-    let stride = (w * 4) as usize;
+fn inflate(
+    w: u32,
+    h: u32,
+    color: u8,
+    plte: Option<&[u8]>,
+    trns: Option<&[u8]>,
+    idat: &[u8],
+) -> Result<Image, Error> {
+    let bpp = match color {
+        0 | 4 => 1,
+        2 => 3,
+        3 => 1,
+        6 => 4,
+        _ => return Err(Error::ColorType(color)),
+    };
+    let stride = w as usize * bpp;
     let expected = (stride + 1) * h as usize;
     let mut decoder = ZlibDecoder::new(idat);
     let mut raw = Vec::with_capacity(expected);
@@ -80,18 +101,75 @@ fn inflate(w: u32, h: u32, idat: &[u8]) -> Result<Image, Error> {
     if raw.len() < expected {
         return Err(Error::Truncated);
     }
-    let mut pixels = vec![0u8; stride * h as usize];
+    let row = (w * 4) as usize;
+    let mut pixels = vec![0u8; row * h as usize];
+    let mut line: Vec<u8> = vec![0; stride];
     let mut prev: Vec<u8> = vec![0; stride];
     let mut pos = 0;
     for y in 0..h as usize {
         let f = raw[pos];
         pos += 1;
-        let line = &mut pixels[y * stride..(y + 1) * stride];
-        defilter_line(f, &raw[pos..pos + stride], line, &prev, 4)?;
+        defilter_line(f, &raw[pos..pos + stride], &mut line, &prev, bpp)?;
         pos += stride;
-        prev.copy_from_slice(line);
+        let out = &mut pixels[y * row..(y + 1) * row];
+        expand_line(color, &line, plte, trns, out)?;
+        prev.copy_from_slice(&line);
     }
     Ok(Image { width: w, height: h, pixels })
+}
+
+fn expand_line(
+    color: u8,
+    line: &[u8],
+    plte: Option<&[u8]>,
+    trns: Option<&[u8]>,
+    out: &mut [u8],
+) -> Result<(), Error> {
+    match color {
+        0 => {
+            for i in 0..line.len() {
+                out[i * 4] = line[i];
+                out[i * 4 + 1] = line[i];
+                out[i * 4 + 2] = line[i];
+                out[i * 4 + 3] = 255;
+            }
+        }
+        2 => {
+            for i in 0..line.len() / 3 {
+                out[i * 4] = line[i * 3];
+                out[i * 4 + 1] = line[i * 3 + 1];
+                out[i * 4 + 2] = line[i * 3 + 2];
+                out[i * 4 + 3] = 255;
+            }
+        }
+        3 => {
+            let pal = plte.ok_or(Error::Truncated)?;
+            for i in 0..line.len() {
+                let idx = line[i] as usize;
+                if idx * 3 + 3 > pal.len() {
+                    return Err(Error::Truncated);
+                }
+                out[i * 4] = pal[idx * 3];
+                out[i * 4 + 1] = pal[idx * 3 + 1];
+                out[i * 4 + 2] = pal[idx * 3 + 2];
+                out[i * 4 + 3] = match trns {
+                    Some(t) if idx < t.len() => t[idx],
+                    _ => 255,
+                };
+            }
+        }
+        4 => {
+            for i in 0..line.len() / 2 {
+                out[i * 4] = line[i * 2];
+                out[i * 4 + 1] = line[i * 2];
+                out[i * 4 + 2] = line[i * 2];
+                out[i * 4 + 3] = line[i * 2 + 1];
+            }
+        }
+        6 => out.copy_from_slice(line),
+        _ => return Err(Error::ColorType(color)),
+    }
+    Ok(())
 }
 
 fn defilter_line(
@@ -186,6 +264,18 @@ mod tests {
     }
 
     fn make_png(w: u32, h: u32, depth: u8, color: u8, interlace: u8, raw: &[u8]) -> Vec<u8> {
+        make_png_extra(w, h, depth, color, interlace, raw, &[])
+    }
+
+    fn make_png_extra(
+        w: u32,
+        h: u32,
+        depth: u8,
+        color: u8,
+        interlace: u8,
+        raw: &[u8],
+        extra: &[(&[u8], &[u8])],
+    ) -> Vec<u8> {
         let mut ihdr: Vec<u8> = Vec::new();
         ihdr.extend_from_slice(&w.to_be_bytes());
         ihdr.extend_from_slice(&h.to_be_bytes());
@@ -198,12 +288,20 @@ mod tests {
         enc.write_all(raw).unwrap();
         let idat = enc.finish().unwrap();
         let mut out: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        for (name, body) in [(b"IHDR", &ihdr[..]), (b"IDAT", &idat[..])] {
+        for (name, body) in extra {
             out.extend_from_slice(&(body.len() as u32).to_be_bytes());
             out.extend_from_slice(name);
             out.extend_from_slice(body);
             out.extend_from_slice(&0u32.to_be_bytes());
         }
+        out.extend_from_slice(&(ihdr.len() as u32).to_be_bytes());
+        out.extend_from_slice(b"IHDR");
+        out.extend_from_slice(&ihdr);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&(idat.len() as u32).to_be_bytes());
+        out.extend_from_slice(b"IDAT");
+        out.extend_from_slice(&idat);
+        out.extend_from_slice(&0u32.to_be_bytes());
         out.extend_from_slice(&0u32.to_be_bytes());
         out.extend_from_slice(b"IEND");
         out.extend_from_slice(&0u32.to_be_bytes());
@@ -215,10 +313,35 @@ mod tests {
         let raw = [0u8, 1, 2, 3, 4, 0, 5, 6, 7, 8, 0, 9, 10, 11, 12];
         let bad = make_png(1, 1, 5, 6, 0, &raw);
         assert!(matches!(decode(&bad), Err(Error::BitDepth(5))));
-        let bad = make_png(1, 1, 8, 2, 0, &raw);
-        assert!(matches!(decode(&bad), Err(Error::ColorType(2))));
+        let bad = make_png(1, 1, 8, 1, 0, &raw);
+        assert!(matches!(decode(&bad), Err(Error::ColorType(1))));
         let bad = make_png(1, 1, 8, 6, 1, &raw);
         assert!(matches!(decode(&bad), Err(Error::Interlaced)));
+    }
+
+    #[test]
+    fn palette_and_rgb_expand_to_rgba() {
+        let plte = [10, 20, 30, 40, 50, 60];
+        let trns = [255u8, 120];
+        let raw = [
+            0, 0, 1, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+        ];
+        let data = make_png_extra(
+            3, 3, 8, 3, 0, &raw,
+            &[(b"PLTE", &plte[..]), (b"tRNS", &trns[..])],
+        );
+        let img = decode(&data).expect("decode palette png");
+        assert_eq!(&img.pixels[..4], &[10, 20, 30, 255]);
+        assert_eq!(&img.pixels[4..8], &[40, 50, 60, 120]);
+        assert_eq!(&img.pixels[12..16], &[40, 50, 60, 120]);
+        let raw = [
+            0, 9, 9, 9, 8, 8, 8, 7, 7, 7,
+        ];
+        let data = make_png(3, 1, 8, 2, 0, &raw);
+        let img = decode(&data).expect("decode rgb png");
+        assert_eq!(&img.pixels[..8], &[9, 9, 9, 255, 8, 8, 8, 255]);
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod nbt;
 mod png;
 mod region;
 mod section;
+mod world;
 mod zipfile;
 mod renderer;
 

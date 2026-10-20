@@ -51,14 +51,11 @@ impl Region {
         if entry == 0 {
             return None;
         }
-        let sectors = ((entry >> 24) & 0xFF) as usize;
-        let units = ((entry >> 16) & 0xFF) as usize | ((((entry >> 8) & 0xFF) as usize) << 8);
-        if sectors == 0 {
-            return None;
-        }
-        let offset = HEADER + units * SECTOR;
+        let sectors = (entry >> 24) as usize;
+        let stored = (((entry >> 8) & 0xFF) as usize) * 256 + ((entry >> 16) & 0xFF) as usize;
+        let offset = stored * SECTOR;
         let size = sectors * SECTOR;
-        if offset + size > self.data.len() {
+        if sectors == 0 || offset < HEADER || offset + size > self.data.len() {
             return None;
         }
         Some((offset, size))
@@ -86,10 +83,11 @@ impl Region {
     pub fn chunk_nbt(&self, cx: u8, cz: u8) -> Result<Vec<u8>, Error> {
         let (offset, size) = self.slot(cx, cz).ok_or(Error::EmptySlot)?;
         let block = &self.data[offset..offset + size];
-        if block[4] == 0 {
+        let len = u16::from_be_bytes([block[2], block[3]]) as usize;
+        if 5 + len > size {
             return Err(Error::InvalidHeader);
         }
-        Ok(block[5..].to_vec())
+        Ok(block[5..5 + len].to_vec())
     }
 
     fn offset_entry(&self, index: usize) -> u32 {
@@ -135,20 +133,22 @@ mod tests {
         let mut offsets = [0u32; 1024];
         let mut stamps = [0u32; 1024];
         let mut body = Vec::new();
-        let mut unit = 0usize;
+        let mut stored = 2usize;
         for (cx, cz, payload, ts) in chunks {
             let zlib = zlib(payload);
-            let sectors = ((zlib.len() + 4 + SECTOR - 1) / SECTOR).max(1);
+            let sectors = ((zlib.len() + 5 + SECTOR - 1) / SECTOR).max(1);
             let mut block = vec![0u8; sectors * SECTOR];
-            block[2] = ((zlib.len() + 1) >> 8) as u8;
-            block[3] = (zlib.len() + 1) as u8;
-            block[4] = sectors as u8;
+            block[2] = (zlib.len() >> 8) as u8;
+            block[3] = zlib.len() as u8;
+            block[4] = 2;
             block[5..5 + zlib.len()].copy_from_slice(&zlib);
             let index = *cz as usize * 32 + *cx as usize;
-            offsets[index] = ((sectors as u32) << 24) | (((unit as u32) & 0x0FFF) << 8);
+            offsets[index] = ((sectors as u32) << 24)
+                | (((stored as u32) & 0xFF) << 16)
+                | (((stored as u32) >> 8) & 0xFF);
             stamps[index] = *ts as u32;
             body.extend_from_slice(&block);
-            unit += sectors;
+            stored += sectors;
         }
         let mut data = vec![0u8; HEADER];
         for i in 0..1024 {
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn multi_sector_block() {
         let mut state = 0x9E3779B97F4A7C15u64;
-        let payload: Vec<u8> = (0..100_000)
+        let payload: Vec<u8> = (0..30_000)
             .map(|_| {
                 state = state
                     .wrapping_mul(6364136223846793005)

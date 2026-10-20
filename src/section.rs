@@ -52,8 +52,10 @@ fn unpack_bits(data: &[i64], bits: u32, out: &mut [u32]) -> Result<(), Error> {
 fn decode_light(light: Option<&Value>) -> [u8; VOXELS] {
     let mut out = [0u8; VOXELS];
     if let Some(bytes) = light.and_then(Value::as_bytes) {
-        for (slot, b) in out.iter_mut().zip(bytes) {
-            *slot = *b as u8;
+        for (i, b) in bytes.iter().enumerate().take(VOXELS / 2) {
+            let v = *b as u8;
+            out[i * 2] = v & 0xF;
+            out[i * 2 + 1] = v >> 4;
         }
     }
     out
@@ -293,10 +295,10 @@ mod tests {
         assert_eq!(section.states[4095], 3);
     }
 
-    fn light_bytes(mut f: impl FnMut(usize) -> i8) -> [i8; 2048] {
-        let mut out = [15i8; 2048];
+    fn light_bytes(mut f: impl FnMut(usize) -> u8) -> [i8; 2048] {
+        let mut out = [0i8; 2048];
         for (i, slot) in out.iter_mut().enumerate() {
-            *slot = f(i);
+            *slot = f(i) as i8;
         }
         out
     }
@@ -304,11 +306,11 @@ mod tests {
     #[test]
     fn synthetic_lights() {
         let block = light_bytes(|i| match i {
-            0 => 0,
-            100 => 7,
-            _ => 15,
+            0 => 0x12,
+            100 => 0x78,
+            _ => 0xF0,
         });
-        let sky = light_bytes(|i| if i == 2047 { 12 } else { 15 });
+        let sky = light_bytes(|i| if i == 2047 { 0x34 } else { 0xFF });
         let data = vec![0x5555555555555555i64; 64];
         let fields = vec![
             tag_byte("Y", 16),
@@ -318,10 +320,13 @@ mod tests {
         ];
         let value = decode_fields(&fields);
         let section = decode_section(&value).unwrap();
-        assert_eq!(section.block_light[0], 0);
-        assert_eq!(section.block_light[100], 7);
-        assert_eq!(section.block_light[101], 15);
-        assert_eq!(section.sky_light[2047], 12);
+        assert_eq!(section.block_light[0], 2);
+        assert_eq!(section.block_light[1], 1);
+        assert_eq!(section.block_light[200], 8);
+        assert_eq!(section.block_light[201], 7);
+        assert_eq!(section.block_light[4095], 15);
+        assert_eq!(section.sky_light[4094], 4);
+        assert_eq!(section.sky_light[4095], 3);
         assert_eq!(section.sky_light[0], 15);
     }
 

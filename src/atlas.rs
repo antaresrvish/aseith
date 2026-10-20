@@ -43,7 +43,7 @@ pub fn build(jar: &str, block_texture_names: &[&str]) -> Result<Atlas, Error> {
         }
         let data = zf.read_entry(&path).map_err(Error::Zip)?;
         let img = png::decode(&data).map_err(Error::Png)?;
-        if img.width != 16 || img.height != 16 {
+        if img.width != 16 || img.height == 0 || img.height % 16 != 0 {
             return Err(Error::WrongSize(name.to_string()));
         }
         let col = (i % t as usize) as u32;
