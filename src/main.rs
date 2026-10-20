@@ -1,3 +1,4 @@
+mod atlas;
 mod blockstates;
 mod blockstates_data;
 mod gpu;
@@ -6,6 +7,7 @@ mod models;
 mod models_bake;
 mod mesh;
 mod nbt;
+mod png;
 mod region;
 mod section;
 mod zipfile;
