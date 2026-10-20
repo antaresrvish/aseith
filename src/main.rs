@@ -2,6 +2,8 @@ mod blockstates;
 mod blockstates_data;
 mod gpu;
 mod level;
+mod models;
+mod models_bake;
 mod mesh;
 mod nbt;
 mod region;
